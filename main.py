@@ -55,8 +55,15 @@ class DocumentHeading(BaseModel):
     level: int = Field(..., ge=1, le=3, description="Heading level (1-3)")
 
 
+class RelevantContentSection(BaseModel):
+    heading: str = Field(..., description="Heading text for this section")
+    paragraphs: list = Field(..., description="Relevant paragraphs from this section")
+
+
 class DocumentContext(BaseModel):
     headings: list = Field(default=[], description="List of headings in the document")
+    heading_hierarchy: Optional[str] = Field(default=None, description="Hierarchical representation of document structure")
+    relevant_content: Optional[list] = Field(default=[], description="Relevant content sections based on user query")
     content_summary: Optional[str] = Field(default="", description="Summary of document content for context")
     has_content: Optional[bool] = Field(default=False, description="Whether the document has existing content")
 
@@ -191,15 +198,36 @@ SUPPORTED ACTIONS
 
 1) replace_section
 - Replaces the ENTIRE content of a section identified by an anchor
-- ONLY use this when the user explicitly asks to rewrite, replace, or recreate a section
-- DO NOT use this for minor corrections, typos, or insertions
-- This action DELETES all existing content in the section and replaces it
+- Use this when the user explicitly asks to:
+  * Rewrite, replace, or recreate a section
+  * Reorder paragraphs or restructure content
+  * Reorganize text for better flow or narrative structure
+- When reordering/restructuring:
+  * Read ALL existing content in the section first
+  * Understand the logical dependencies (what must come before what)
+  * Reorganize paragraphs/sentences based on contextual dependencies
+  * Preserve ALL facts and information, only change the order
+  * Follow user's specific ordering rules (e.g., "introduce X before explaining Y")
+- DO NOT use this for minor corrections, typos, or simple insertions
+- This action DELETES all existing content in the section and replaces it with the reordered version
 
 2) update_heading_style
 - Updates formatting for existing headings
-- Used for requests like "change headings to blue"
+- Used for requests like:
+  * "change headings to blue" → target: "all"
+  * "make the heading Pyramids blue" → target: "specific", heading_text: "Pyramids"
+  * "make headings centered and bold" → target: "all"
+- Supports: color, alignment (left/center/right/justify), bold
+- target can be "all" (all headings) or "specific" (one heading by text)
+- When target is "specific", heading_text is REQUIRED - use partial matching to find the heading
 
-3) correct_text
+3) update_text_format
+- Updates formatting for text (headings, paragraphs, or all)
+- Used for requests like "make all text red", "center all paragraphs", "make headings bold and centered"
+- Supports: color, alignment (left/center/right/justify), bold
+- target can be "all", "headings", or "paragraphs"
+
+4) correct_text
 - Finds and replaces SPECIFIC text in the document WITHOUT affecting other content
 - Use this for: typos, word replacements, small text corrections
 - Example: "fix the typo 'teh' to 'the'" → only changes 'teh' to 'the', keeps everything else
@@ -209,7 +237,7 @@ SUPPORTED ACTIONS
 - This is the PREFERRED action for corrections and small changes
 - DO NOT use replace_section for simple corrections - use correct_text instead
 
-4) insert_text
+5) insert_text
 - Inserts new content at the start, end, or after a specific heading WITHOUT deleting existing content
 - Use this when the user asks to "insert", "add at the start", "add at the end", "add to this heading/section"
 - Example: "insert 'Introduction' at the start" → adds heading at start, keeps existing content
@@ -244,7 +272,12 @@ EDIT PLAN SCHEMA (STRICT)
           },
           {
             "type": "paragraph",
-            "text": "<paragraph text>"
+            "text": "<paragraph text>",
+            "style": {
+              "color": "<optional>",
+              "alignment": "<optional: left|center|right|justify>",
+              "bold": "<optional: true|false>"
+            }
           }
         ]
       },
@@ -252,7 +285,26 @@ EDIT PLAN SCHEMA (STRICT)
         "type": "update_heading_style",
         "target": "all",
         "style": {
+          "color": "blue",
+          "alignment": "center",
+          "bold": true
+        }
+      },
+      {
+        "type": "update_heading_style",
+        "target": "specific",
+        "heading_text": "Pyramids",
+        "style": {
           "color": "blue"
+        }
+      },
+      {
+        "type": "update_text_format",
+        "target": "all",
+        "style": {
+          "color": "red",
+          "alignment": "center",
+          "bold": false
         }
       },
       {
@@ -300,7 +352,7 @@ RULES (VERY IMPORTANT)
 2) Only use the supported actions and block types.
    - No tables
    - No lists
-   - No inline formatting except color on headings
+   - Formatting: color, alignment (left/center/right/justify), bold for both headings and paragraphs
 
 3) Paragraph rules:
    - Each paragraph is ONE block
@@ -313,14 +365,27 @@ RULES (VERY IMPORTANT)
    - Formatting goes into the "style" object
 
 5) Formatting changes:
-   - If the user asks to change heading color (e.g. "make headings blue"),
-     you MUST use the action "update_heading_style"
-   - Do NOT rewrite the headings unless explicitly asked
+   - Formatting options: color (hex, rgb, or named colors), alignment (left/center/right/justify), bold (true/false)
+   - CRITICAL: Formatting requests should NEVER use replace_section - they should use formatting actions
+   - If the user asks to format ALL headings (e.g. "make headings blue", "center headings", "make headings bold and red"),
+     use "update_heading_style" with target: "all"
+   - If the user asks to format a SPECIFIC heading by name (e.g. "make the heading Pyramids blue", "center the heading Introduction"),
+     use "update_heading_style" with target: "specific" and heading_text: "<heading text>" (use partial matching)
+   - If the user asks to format text/paragraphs (e.g. "make all text red", "center all paragraphs", "make text bold"),
+     use "update_text_format" with target: "all", "headings", or "paragraphs"
+   - Formatting can be applied to individual blocks in replace_section and insert_text actions using the "style" property
+   - Examples:
+     * "make headings centered, red, and bold" → update_heading_style with target: "all", style: {alignment: "center", color: "red", bold: true}
+     * "make the heading Pyramids blue" → update_heading_style with target: "specific", heading_text: "Pyramids", style: {color: "blue"}
+     * "center all text" → update_text_format with target: "all", style: {alignment: "center"}
+     * "make paragraphs bold" → update_text_format with target: "paragraphs", style: {bold: true}
+   - Do NOT use replace_section for formatting - it will DELETE all content! Use formatting actions instead
 
 6) Anchors:
    - If the user does not specify a section, use anchor "main"
-   - BUT: Only use replace_section if the user explicitly wants to replace a whole section
-   - For insertions at the start, use replace_section with anchor "main" but PRESERVE existing content in blocks
+   - BUT: Only use replace_section if the user explicitly wants to replace/rewrite/reorder a whole section
+   - For insertions at the start, use insert_text with location: "start" instead of replace_section
+   - For reordering/restructuring: use replace_section with anchor "main" (or specific section), include ALL existing content in reordered blocks
 
 7) Text corrections and minimal changes:
    - ALWAYS prefer "correct_text" for: typos, word changes, small corrections
@@ -340,23 +405,32 @@ RULES (VERY IMPORTANT)
      * Match the user's reference to an existing heading using partial matching
      * Use insert_text with location: "after_heading" and heading_text: "<matched heading text from document>"
    
-   - SEMANTIC CONTEXT MATCHING (for phrases like "insert more about X", "add information about Y"):
-     * Analyze the document content_summary and headings to understand context
+   - SEMANTIC CONTEXT MATCHING AND INTELLIGENT PLACEMENT (for phrases like "insert more about X", "add information about Y"):
+     * Analyze the document structure (heading hierarchy) and relevant content to understand context
      * Look for semantic relationships between user request and document headings
      * Works for ANY content type: persons, topics, concepts, objects, subjects, etc.
+     
+     * INTELLIGENT PLACEMENT LOGIC:
+       1. Identify the main topic/entity from user request (e.g., "his career" → person, "methodology" → thesis)
+       2. Find the most relevant main heading (e.g., "John F Kennedy", "Bachelor Thesis")
+       3. Check if there's a more specific subsection that matches the user's request:
+          - User: "add more about career" + Document has "John F Kennedy" (H1) with "Career" (H2) → insert after "Career" (H2)
+          - User: "add methodology" + Document has "Bachelor Thesis" (H1) with "Methodology" (H2) → insert after "Methodology" (H2)
+          - User: "add methodology" + Document has "Bachelor Thesis" (H1) but NO "Methodology" subsection → insert after "Bachelor Thesis" (H1)
+       4. Use heading hierarchy: prefer more specific (lower level) headings when they match
+       5. If no exact match, use the most semantically relevant heading
+     
      * Examples of semantic matching:
        - "his career" / "his early life" → find person headings (e.g., "John F Kennedy")
        - "methodology" / "results" → find academic headings (e.g., "Bachelor Thesis", "Research Paper")
        - "construction" / "architecture" → find object/topic headings (e.g., "Pyramids", "Ancient Buildings")
        - "history" / "origins" → find topic headings (e.g., "Ancient Egypt", "Roman Empire")
-     * Match user's topic/concept to the most relevant heading in the document
-     * Use intelligent matching: if document has "Pyramids" heading and user says "construction methods",
-       insert after "Pyramids" heading
-     * If multiple headings match, choose the most semantically relevant one
-     * Examples:
-       - "insert more about his career" with heading "John F Kennedy" → insert after "John F Kennedy"
-       - "add methodology section" with heading "Bachelor Thesis" → insert after "Bachelor Thesis"
-       - "add information about construction" with heading "Pyramids" → insert after "Pyramids"
+     
+     * Placement examples:
+       - "insert more about his career" with "John F Kennedy" (H1) and "Career" (H2) → insert after "Career" (H2)
+       - "add methodology section" with "Bachelor Thesis" (H1) and "Methodology" (H2) → insert after "Methodology" (H2)
+       - "add methodology section" with "Bachelor Thesis" (H1) but no "Methodology" → insert after "Bachelor Thesis" (H1)
+       - "add information about construction" with "Pyramids" (H1) → insert after "Pyramids" (H1)
    
    - Context awareness priority:
      1. Document structure (headings + content_summary) - PRIMARY source
@@ -387,7 +461,9 @@ EXAMPLES OF USER REQUESTS YOU MUST HANDLE
 - "Write an introduction about climate change" (use replace_section with anchor "main")
 - "Rewrite this section more professionally" (use replace_section - user explicitly wants rewrite)
 - "Add a heading and two paragraphs" (use replace_section, but preserve existing content)
-- "Change all headings to blue" (use update_heading_style)
+- "Change all headings to blue" (use update_heading_style with target: "all")
+- "Make the heading Pyramids blue" (use update_heading_style with target: "specific", heading_text: "Pyramids")
+- "Make headings centered, red, and bold" (use update_heading_style with target: "all", style: {alignment: "center", color: "red", bold: true})
 - "Improve the text and make headings blue" (use replace_section if rewriting, update_heading_style for color)
 - "Fix the typo 'teh' to 'the'" (use correct_text - ONLY fixes the typo)
 - "Change 'climate change' to 'global warming'" (use correct_text - ONLY changes that phrase)
@@ -435,16 +511,23 @@ def generate_edit_plan(prompt: str, conversation_history: Optional[list] = None,
         # Build user message with document context
         user_message = f"User request: {prompt}\n\n"
         
-        # Add document context (headings and content) if provided
+        # Add document context (headings and relevant content) if provided
         if document_context:
             headings = document_context.get("headings", [])
+            heading_hierarchy = document_context.get("heading_hierarchy", "")
+            relevant_content = document_context.get("relevant_content", [])
             content_summary = document_context.get("content_summary", "")
             has_content = document_context.get("has_content", False)
             
             if has_content:
                 user_message += "⚠️ IMPORTANT: This document already has content. Preserve existing content unless explicitly asked to replace it.\n\n"
             
-            if headings:
+            # Show hierarchical structure first (most important for placement decisions)
+            if heading_hierarchy:
+                user_message += "Document structure (hierarchical view - use this to understand parent-child relationships):\n"
+                user_message += heading_hierarchy
+                user_message += "\n\n"
+            elif headings:
                 user_message += "Current document structure (headings):\n"
                 for heading in headings:
                     if isinstance(heading, dict) and "text" in heading:
@@ -453,17 +536,48 @@ def generate_edit_plan(prompt: str, conversation_history: Optional[list] = None,
                         user_message += f"  - Heading {level}: {text}\n"
                 user_message += "\n"
             
-            if content_summary:
+            # Add relevant content sections based on user query
+            if relevant_content:
+                user_message += "Relevant document content (sections matching your query):\n"
+                for section in relevant_content:
+                    if isinstance(section, dict) and "heading" in section:
+                        heading_text = section.get("heading", "")
+                        level = section.get("level", 1)
+                        paragraphs = section.get("paragraphs", [])
+                        user_message += f"\nSection (Heading {level}): {heading_text}\n"
+                        for para in paragraphs[:3]:  # Max 3 paragraphs per section
+                            if para:
+                                user_message += f"  {para[:200]}...\n"
+                user_message += "\n"
+                user_message += "INTELLIGENT PLACEMENT INSTRUCTIONS:\n"
+                user_message += "- Use the hierarchical structure above to understand parent-child relationships between headings\n"
+                user_message += "- Analyze the document structure to find the BEST placement location\n"
+                user_message += "- When user says 'add X about Y' or 'insert more about X':\n"
+                user_message += "  1. Identify the main topic Y from the user request (e.g., 'his career' → person, 'methodology' → thesis)\n"
+                user_message += "  2. Find the most relevant main heading (e.g., 'John F Kennedy' for person, 'Bachelor Thesis' for thesis)\n"
+                user_message += "  3. Check the hierarchy for a more specific subsection that matches X:\n"
+                user_message += "     - If 'Career' (H2) exists under 'John F Kennedy' (H1) and user says 'add more about career' → insert after 'Career' (H2)\n"
+                user_message += "     - If 'Methodology' (H2) exists under 'Bachelor Thesis' (H1) and user says 'add methodology' → insert after 'Methodology' (H2)\n"
+                user_message += "     - If NO subsection exists, insert after the main heading\n"
+                user_message += "  4. Always prefer the MOST SPECIFIC matching heading (lower level number = more specific)\n"
+                user_message += "  5. Use semantic matching: 'career' matches 'Career', 'methodology' matches 'Methodology', etc.\n"
+                user_message += "- Examples:\n"
+                user_message += "  * User: 'add more about career' + Doc has 'John F Kennedy' (H1) with 'Career' (H2) → insert after 'Career' (H2)\n"
+                user_message += "  * User: 'add methodology' + Doc has 'Bachelor Thesis' (H1) with 'Methodology' (H2) → insert after 'Methodology' (H2)\n"
+                user_message += "  * User: 'add methodology' + Doc has 'Bachelor Thesis' (H1) but NO 'Methodology' → insert after 'Bachelor Thesis' (H1)\n"
+                user_message += "  * User: 'add construction details' + Doc has 'Pyramids' (H1) → insert after 'Pyramids' (H1)\n\n"
+            elif content_summary:
                 user_message += f"Document content summary (for context): {content_summary[:500]}...\n\n"
             
-            if headings or content_summary:
+            if headings or relevant_content or content_summary:
                 user_message += "CONTEXT AWARENESS INSTRUCTIONS:\n"
-                user_message += "- Use these headings to understand document structure\n"
+                user_message += "- Use the headings and relevant content above to understand document structure and context\n"
                 user_message += "- When user refers to a heading (e.g., 'john f', 'early life'), match it to the closest heading above using partial matching\n"
-                user_message += "- When user says 'insert more about X' or 'add information about Y', analyze the document to find the best location\n"
-                user_message += "- Look for semantic relationships: match user's topic to relevant headings (persons, topics, concepts, objects, etc.)\n"
+                user_message += "- When user says 'insert more about X' or 'add information about Y', analyze the relevant content sections to find the best location\n"
+                user_message += "- Look for semantic relationships: match user's topic to relevant headings and content (persons, topics, concepts, objects, etc.)\n"
                 user_message += "- Examples: 'his career' → person heading, 'methodology' → thesis/research heading, 'construction' → object/topic heading\n"
-                user_message += "- Make intelligent placement decisions based on document structure and content\n"
+                user_message += "- Use the relevant content sections to understand what already exists and where new content should be placed\n"
+                user_message += "- Make intelligent placement decisions based on document structure and relevant content\n"
                 user_message += "- If document has existing content, use insert_text instead of replace_section unless explicitly asked to replace\n\n"
         
         user_message += "Generate the EditPlan JSON:"
