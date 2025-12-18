@@ -50,8 +50,21 @@ client = AzureOpenAI(
 
 
 # Request/Response Models
+class DocumentHeading(BaseModel):
+    text: str = Field(..., description="Heading text")
+    level: int = Field(..., ge=1, le=3, description="Heading level (1-3)")
+
+
+class DocumentContext(BaseModel):
+    headings: list = Field(default=[], description="List of headings in the document")
+    content_summary: Optional[str] = Field(default="", description="Summary of document content for context")
+    has_content: Optional[bool] = Field(default=False, description="Whether the document has existing content")
+
+
 class GenerateEditPlanRequest(BaseModel):
     prompt: str = Field(..., description="User prompt describing document changes")
+    conversation_history: Optional[list] = Field(default=[], description="Previous conversation messages for context")
+    document_context: Optional[DocumentContext] = Field(default=None, description="Current document structure (headings) for context awareness")
 
 
 class BlockStyle(BaseModel):
@@ -82,6 +95,21 @@ class UpdateHeadingStyleAction(BaseModel):
     style: BlockStyle = Field(..., description="Style to apply to all headings")
 
 
+class CorrectTextAction(BaseModel):
+    type: str = Field("correct_text", literal=True)
+    search_text: str = Field(..., description="Text to search for in the document")
+    replacement_text: str = Field(..., description="Text to replace the search text with")
+    case_sensitive: Optional[bool] = Field(False, description="Whether the search should be case sensitive")
+
+
+class InsertTextAction(BaseModel):
+    type: str = Field("insert_text", literal=True)
+    anchor: str = Field(..., description="Anchor identifier (usually 'main')")
+    location: str = Field(..., description="Where to insert: 'start', 'end', or 'after_heading'")
+    heading_text: Optional[str] = Field(None, description="Heading text to find (required when location is 'after_heading')")
+    blocks: list = Field(..., description="List of paragraph or heading blocks to insert")
+
+
 class EditPlan(BaseModel):
     version: str = Field("1.0", literal=True)
     actions: list = Field(..., description="List of edit actions")
@@ -101,10 +129,46 @@ Your job:
   1) A short natural-language response to the user (what you did / will do).
   2) A structured EditPlan describing exactly how the document should be edited.
 
+CRITICAL: Make MINIMAL, TARGETED changes. Only change what the user explicitly requests.
+- If the user asks to fix a typo, ONLY fix that typo, don't replace the whole text
+- If the user asks to insert text at the start, ONLY insert at the start, don't delete existing content
+- If the user asks to change specific text, ONLY change that text, preserve everything else
+- Preserve all existing content unless explicitly asked to replace it
+
 The document editor supports ONLY:
 - Paragraphs
 - Headings
 - Basic formatting (color)
+
+CONTENT AWARENESS (CRITICAL):
+- You will receive the current document structure (headings and content summary) in the user message
+- ALWAYS check if the document has existing content before making changes
+- Use document headings and content to understand context and make intelligent placement decisions
+
+Heading Matching:
+- When the user refers to a heading (e.g., "john f", "early life"), match it to existing headings
+- Use partial matching: "john f" should match "John F Kennedy", "early life" should match "Early Life of John F Kennedy"
+- Match headings case-insensitively and by partial text
+- When inserting content "under" or "to" a heading, use insert_text with location: "after_heading" and the matching heading text
+
+Semantic Context Understanding:
+- When user says "insert more about X", "add information about Y", "add details about Z", analyze the document content
+- Look for related headings or topics in the document that semantically relate to the user's request
+- Match ANY type of content: persons, topics, concepts, objects, etc.
+- Examples:
+  * "insert more about his career" with heading "John F Kennedy" → insert after "John F Kennedy"
+  * "add methodology section" with heading "Bachelor Thesis" → insert after "Bachelor Thesis"
+  * "add information about construction" with heading "Pyramids" → insert after "Pyramids"
+  * "add more about history" with heading "Ancient Egypt" → insert after "Ancient Egypt"
+- Use the content_summary to understand what the document is about
+- Make intelligent decisions about where content fits best based on semantic relationships
+- Match topics, concepts, and any entities mentioned in headings to user requests
+
+Initial Prompts on Existing Documents:
+- If document has_content is true, DO NOT use replace_section unless explicitly asked to replace
+- Instead, use insert_text to add new content while preserving existing content
+- Analyze existing headings to understand document structure
+- Place new content in the most appropriate location based on context
 
 You must express ALL document changes using the EditPlan schema below.
 Do NOT describe edits in prose.
@@ -126,11 +190,36 @@ SUPPORTED ACTIONS
 ────────────────────────────────
 
 1) replace_section
-- Replaces the content of a section identified by an anchor
+- Replaces the ENTIRE content of a section identified by an anchor
+- ONLY use this when the user explicitly asks to rewrite, replace, or recreate a section
+- DO NOT use this for minor corrections, typos, or insertions
+- This action DELETES all existing content in the section and replaces it
 
 2) update_heading_style
 - Updates formatting for existing headings
 - Used for requests like "change headings to blue"
+
+3) correct_text
+- Finds and replaces SPECIFIC text in the document WITHOUT affecting other content
+- Use this for: typos, word replacements, small text corrections
+- Example: "fix the typo 'teh' to 'the'" → only changes 'teh' to 'the', keeps everything else
+- Example: "change 'climate change' to 'global warming'" → only changes that phrase
+- The search_text should be the EXACT text to find (or close approximation)
+- The replacement_text should be what to replace it with
+- This is the PREFERRED action for corrections and small changes
+- DO NOT use replace_section for simple corrections - use correct_text instead
+
+4) insert_text
+- Inserts new content at the start, end, or after a specific heading WITHOUT deleting existing content
+- Use this when the user asks to "insert", "add at the start", "add at the end", "add to this heading/section"
+- Example: "insert 'Introduction' at the start" → adds heading at start, keeps existing content
+- Example: "add a paragraph at the end" → adds paragraph at end, keeps existing content
+- Example: "add a starting paragraph to this heading" → adds paragraph after the heading mentioned in conversation
+- location must be "start", "end", or "after_heading"
+- When location is "after_heading", heading_text is REQUIRED - extract the heading text from conversation history
+- If user says "this heading", "this section", "to this content", look at conversation history to find the heading text
+- anchor is usually "main" for document-level insertions
+- This is the PREFERRED action for insertions - preserves all existing content
 
 ────────────────────────────────
 EDIT PLAN SCHEMA (STRICT)
@@ -165,6 +254,36 @@ EDIT PLAN SCHEMA (STRICT)
         "style": {
           "color": "blue"
         }
+      },
+      {
+        "type": "correct_text",
+        "search_text": "climate change",
+        "replacement_text": "global warming",
+        "case_sensitive": false
+      },
+      {
+        "type": "insert_text",
+        "anchor": "main",
+        "location": "start",
+        "blocks": [
+          {
+            "type": "heading",
+            "level": 1,
+            "text": "Introduction"
+          }
+        ]
+      },
+      {
+        "type": "insert_text",
+        "anchor": "main",
+        "location": "after_heading",
+        "heading_text": "Introduction",
+        "blocks": [
+          {
+            "type": "paragraph",
+            "text": "This is a paragraph added after the Introduction heading"
+          }
+        ]
       }
     ]
   }
@@ -200,8 +319,62 @@ RULES (VERY IMPORTANT)
 
 6) Anchors:
    - If the user does not specify a section, use anchor "main"
+   - BUT: Only use replace_section if the user explicitly wants to replace a whole section
+   - For insertions at the start, use replace_section with anchor "main" but PRESERVE existing content in blocks
 
-7) Output rules:
+7) Text corrections and minimal changes:
+   - ALWAYS prefer "correct_text" for: typos, word changes, small corrections
+   - When the user asks to "fix", "correct", "change [specific text]", use correct_text
+   - Look at conversation history to understand what text was previously mentioned
+   - Extract the exact or approximate text to search for from the conversation
+   - If the user says "change that" or "fix it", refer to the conversation history to find what "that" or "it" refers to
+   - Use case_sensitive: false by default unless the user specifically mentions case sensitivity
+
+8) Insertions and intelligent content placement:
+   - ALWAYS use "insert_text" when the user asks to "insert", "add", "add more about", "insert information about"
+   - insert_text preserves ALL existing content - it only adds new content
+   - If user says "insert X at the start", use insert_text with location: "start"
+   - If user says "add X at the end", use insert_text with location: "end"
+   - If user mentions a specific heading (e.g., "add early life of john f"):
+     * Check the document structure (headings list) provided in the user message
+     * Match the user's reference to an existing heading using partial matching
+     * Use insert_text with location: "after_heading" and heading_text: "<matched heading text from document>"
+   
+   - SEMANTIC CONTEXT MATCHING (for phrases like "insert more about X", "add information about Y"):
+     * Analyze the document content_summary and headings to understand context
+     * Look for semantic relationships between user request and document headings
+     * Works for ANY content type: persons, topics, concepts, objects, subjects, etc.
+     * Examples of semantic matching:
+       - "his career" / "his early life" → find person headings (e.g., "John F Kennedy")
+       - "methodology" / "results" → find academic headings (e.g., "Bachelor Thesis", "Research Paper")
+       - "construction" / "architecture" → find object/topic headings (e.g., "Pyramids", "Ancient Buildings")
+       - "history" / "origins" → find topic headings (e.g., "Ancient Egypt", "Roman Empire")
+     * Match user's topic/concept to the most relevant heading in the document
+     * Use intelligent matching: if document has "Pyramids" heading and user says "construction methods",
+       insert after "Pyramids" heading
+     * If multiple headings match, choose the most semantically relevant one
+     * Examples:
+       - "insert more about his career" with heading "John F Kennedy" → insert after "John F Kennedy"
+       - "add methodology section" with heading "Bachelor Thesis" → insert after "Bachelor Thesis"
+       - "add information about construction" with heading "Pyramids" → insert after "Pyramids"
+   
+   - Context awareness priority:
+     1. Document structure (headings + content_summary) - PRIMARY source
+     2. Semantic analysis of user request vs document content
+     3. Conversation history - TERTIARY source
+   
+   - DO NOT use replace_section for insertions - use insert_text instead
+
+9) Content preservation:
+   - correct_text: ONLY changes the specified text, preserves everything else
+   - insert_text: ONLY adds new content, preserves all existing content
+   - replace_section: Replaces entire section - ONLY use when user explicitly wants to replace/rewrite
+   - If user says "fix typo", use correct_text to ONLY fix that typo
+   - If user says "change X to Y", use correct_text to ONLY change X to Y
+   - If user says "insert X", use insert_text to ONLY add X
+   - NEVER delete content unless explicitly asked to replace/rewrite
+
+10) Output rules:
    - Output EXACTLY one JSON object
    - No comments
    - No trailing text
@@ -211,24 +384,90 @@ RULES (VERY IMPORTANT)
 EXAMPLES OF USER REQUESTS YOU MUST HANDLE
 ────────────────────────────────
 
-- "Write an introduction about climate change"
-- "Rewrite this section more professionally"
-- "Add a heading and two paragraphs"
-- "Change all headings to blue"
-- "Improve the text and make headings blue"
+- "Write an introduction about climate change" (use replace_section with anchor "main")
+- "Rewrite this section more professionally" (use replace_section - user explicitly wants rewrite)
+- "Add a heading and two paragraphs" (use replace_section, but preserve existing content)
+- "Change all headings to blue" (use update_heading_style)
+- "Improve the text and make headings blue" (use replace_section if rewriting, update_heading_style for color)
+- "Fix the typo 'teh' to 'the'" (use correct_text - ONLY fixes the typo)
+- "Change 'climate change' to 'global warming'" (use correct_text - ONLY changes that phrase)
+- "Insert 'Introduction' at the start" (use insert_text with location: "start" - preserves existing content)
+- "Add a paragraph at the end" (use insert_text with location: "end" - preserves existing content)
+- "Add a starting paragraph to this heading" (use insert_text with location: "after_heading", heading_text from conversation)
+- "Add content to this section" (use insert_text with location: "after_heading", find heading from conversation history)
+- "Insert more about his career" (analyze document, find person heading, use insert_text with location: "after_heading")
+- "Add information about early life" (analyze document, find relevant heading, use insert_text with location: "after_heading")
+- "Add methodology section" (analyze document, find thesis/research heading, use insert_text with location: "after_heading")
+- "Add information about construction" (analyze document, find pyramids/building heading, use insert_text with location: "after_heading")
+- "Change that to 'new text'" (use correct_text, refer to conversation history)
 
 Think first.
 Then produce the final JSON object."""
 
 
-def generate_edit_plan(prompt: str) -> Dict[str, Any]:
+def generate_edit_plan(prompt: str, conversation_history: Optional[list] = None, document_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Generate EditPlan JSON from user prompt using Azure OpenAI
     """
     logger.info(f"Generating edit plan for prompt: {prompt[:100]}...")
     try:
-        # Create the user message
-        user_message = f"User request: {prompt}\n\nGenerate the EditPlan JSON:"
+        # Build messages with conversation history
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        
+        # Add conversation history if provided
+        if conversation_history:
+            for msg in conversation_history:
+                if isinstance(msg, dict) and "role" in msg and "content" in msg:
+                    # Convert "ai" role to "assistant" for OpenAI API compatibility
+                    role = msg["role"]
+                    if role == "ai":
+                        role = "assistant"
+                    elif role not in ["system", "assistant", "user", "function", "tool", "developer"]:
+                        # Skip invalid roles
+                        logger.warning(f"Skipping message with invalid role: {role}")
+                        continue
+                    
+                    messages.append({
+                        "role": role,
+                        "content": msg["content"]
+                    })
+        
+        # Build user message with document context
+        user_message = f"User request: {prompt}\n\n"
+        
+        # Add document context (headings and content) if provided
+        if document_context:
+            headings = document_context.get("headings", [])
+            content_summary = document_context.get("content_summary", "")
+            has_content = document_context.get("has_content", False)
+            
+            if has_content:
+                user_message += "⚠️ IMPORTANT: This document already has content. Preserve existing content unless explicitly asked to replace it.\n\n"
+            
+            if headings:
+                user_message += "Current document structure (headings):\n"
+                for heading in headings:
+                    if isinstance(heading, dict) and "text" in heading:
+                        level = heading.get("level", 1)
+                        text = heading.get("text", "")
+                        user_message += f"  - Heading {level}: {text}\n"
+                user_message += "\n"
+            
+            if content_summary:
+                user_message += f"Document content summary (for context): {content_summary[:500]}...\n\n"
+            
+            if headings or content_summary:
+                user_message += "CONTEXT AWARENESS INSTRUCTIONS:\n"
+                user_message += "- Use these headings to understand document structure\n"
+                user_message += "- When user refers to a heading (e.g., 'john f', 'early life'), match it to the closest heading above using partial matching\n"
+                user_message += "- When user says 'insert more about X' or 'add information about Y', analyze the document to find the best location\n"
+                user_message += "- Look for semantic relationships: match user's topic to relevant headings (persons, topics, concepts, objects, etc.)\n"
+                user_message += "- Examples: 'his career' → person heading, 'methodology' → thesis/research heading, 'construction' → object/topic heading\n"
+                user_message += "- Make intelligent placement decisions based on document structure and content\n"
+                user_message += "- If document has existing content, use insert_text instead of replace_section unless explicitly asked to replace\n\n"
+        
+        user_message += "Generate the EditPlan JSON:"
+        messages.append({"role": "user", "content": user_message})
 
         # Call Azure OpenAI with structured output
         # Note: response_format may not be supported in all Azure OpenAI deployments
@@ -236,10 +475,7 @@ def generate_edit_plan(prompt: str) -> Dict[str, Any]:
         try:
             response = client.chat.completions.create(
                 model=MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_message}
-                ],
+                messages=messages,
                 response_format={"type": "json_object"},  # Force JSON output
                 max_completion_tokens=4000
             )
@@ -325,10 +561,13 @@ def generate_edit_plan(prompt: str) -> Dict[str, Any]:
 @app.post("/api/generate-edit-plan", response_model=EditPlanResponse)
 async def generate_edit_plan_endpoint(request: GenerateEditPlanRequest):
     """
-    Generate an EditPlan from a user prompt
+    Generate an EditPlan from a user prompt with optional conversation history and document context
     """
     try:
-        result = generate_edit_plan(request.prompt)
+        document_context_dict = None
+        if request.document_context:
+            document_context_dict = request.document_context.dict() if hasattr(request.document_context, 'dict') else request.document_context
+        result = generate_edit_plan(request.prompt, request.conversation_history, document_context_dict)
         return EditPlanResponse(**result)
     except HTTPException:
         raise
