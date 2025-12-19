@@ -68,10 +68,17 @@ class DocumentContext(BaseModel):
     has_content: Optional[bool] = Field(default=False, description="Whether the document has existing content")
 
 
+class SemanticDocument(BaseModel):
+    sections: list = Field(default=[], description="List of document sections with IDs")
+    blocks: Dict[str, Any] = Field(default={}, description="Map of block_id to block content")
+
+
 class GenerateEditPlanRequest(BaseModel):
     prompt: str = Field(..., description="User prompt describing document changes")
     conversation_history: Optional[list] = Field(default=[], description="Previous conversation messages for context")
     document_context: Optional[DocumentContext] = Field(default=None, description="Current document structure (headings) for context awareness")
+    semantic_document: Optional[SemanticDocument] = Field(default=None, description="Semantic document structure with sections and blocks with IDs")
+    selected_range: Optional[Dict[str, Any]] = Field(default=None, description="Selected text range with tag and text")
 
 
 class BlockStyle(BaseModel):
@@ -92,7 +99,7 @@ class HeadingBlock(BaseModel):
 
 class ReplaceSectionAction(BaseModel):
     type: str = Field("replace_section", literal=True)
-    anchor: str = Field(..., description="Anchor identifier for the section")
+    anchor: str = Field(..., description="Anchor identifier for the section (e.g., 'main', 'selected')")
     blocks: list = Field(..., description="List of paragraph or heading blocks")
 
 
@@ -112,8 +119,9 @@ class CorrectTextAction(BaseModel):
 class InsertTextAction(BaseModel):
     type: str = Field("insert_text", literal=True)
     anchor: str = Field(..., description="Anchor identifier (usually 'main')")
-    location: str = Field(..., description="Where to insert: 'start', 'end', or 'after_heading'")
+    location: str = Field(..., description="Where to insert: 'start', 'end', 'after_heading', or 'at_position'")
     heading_text: Optional[str] = Field(None, description="Heading text to find (required when location is 'after_heading')")
+    position: Optional[int] = Field(None, description="Position to insert at (required when location is 'at_position')")
     blocks: list = Field(..., description="List of paragraph or heading blocks to insert")
 
 
@@ -125,9 +133,106 @@ class EditPlan(BaseModel):
 class EditPlanResponse(BaseModel):
     response: str = Field(..., description="Natural language explanation of what was done")
     edit_plan: EditPlan
+    ops: Optional[list] = Field(None, description="Semantic edit operations (used when semantic_document is provided)")
 
 
-# System prompt for the AI agent
+# Semantic editing system prompt
+SEMANTIC_SYSTEM_PROMPT = """You are an AI agent that edits Microsoft Word documents semantically and structurally, not by guessing positions.
+
+Your task is to decide WHAT edit should be made, WHERE it should be made, and WHY.
+
+You will receive:
+- A structured representation of a Word document (sections, blocks, headings).
+- A user instruction such as "add X" or "insert Y".
+- Optional domain rules (e.g. biography, CV, report).
+
+You must return edit operations in JSON format that the Word Add-in will execute.
+
+DOCUMENT MODEL
+
+The document is represented as:
+- Sections (derived from Word headings)
+- Blocks (paragraphs, lists, etc.)
+- Each block has a stable block_id
+
+Example:
+{
+  "sections": [
+    {"id":"s1","title":"Biography","level":1,"blocks":["b1","b2"]},
+    {"id":"s2","title":"Career","level":1,"blocks":["b3","b4"]}
+  ],
+  "blocks": {
+    "b1":{"type":"paragraph","text":"Max Mustermann is a software engineer."},
+    "b2":{"type":"paragraph","text":"He grew up in Vienna."},
+    "b3":{"type":"paragraph","text":"In 2012 he started his career at..."}
+  }
+}
+
+YOUR GOAL
+
+Choose the most semantically appropriate location in the document and describe the edit as an operation.
+
+You must respect logical document structure and meaning, not just proximity.
+
+Example rules for biographies:
+- Birth information belongs in the introduction or early life, not at the end.
+- Education belongs after early life and before career.
+- Career milestones go into the career section in chronological order.
+- Awards go after career or in a dedicated section.
+- Death information (if any) belongs at the end of the biography.
+
+OUTPUT FORMAT (MANDATORY)
+
+You must output only valid JSON in this format:
+{
+  "response": "Short explanation of what you will do",
+  "ops": [
+    {
+      "action": "insert_after | insert_before | replace",
+      "target_block_id": "block_id",
+      "content": "Text to be inserted",
+      "reason": "Short explanation of why this location is semantically correct"
+    }
+  ]
+}
+
+CRITICAL: You MUST include both "response" and "ops" fields. Do NOT use "edit_plan" format.
+
+Rules:
+- Do NOT invent block IDs. Only use block IDs that exist in the document.
+- Do NOT output plain text outside JSON.
+- Always include a short semantic reasoning.
+- Prefer editing existing relevant sections over appending content at the end.
+- If no suitable place exists, choose the closest logically correct section.
+
+EXAMPLE
+
+User instruction: "Add: Born on March 12, 1984 in Vienna."
+
+Correct response:
+{
+  "response": "I will add the birth information to the introductory paragraph of the biography.",
+  "ops": [
+    {
+      "action": "insert_after",
+      "target_block_id": "b1",
+      "content": "He was born on March 12, 1984 in Vienna.",
+      "reason": "Birth information belongs in the introductory paragraph of a biography, not at the end."
+    }
+  ]
+}
+
+IMPORTANT BEHAVIOR
+
+- Think in terms of document meaning, not text position.
+- Your output will be executed automatically — incorrect placement is a critical error.
+- When unsure, choose the option that best preserves readability, chronology, and common writing conventions.
+- For "replace" actions, the target_block_id should be the block to replace.
+- For "insert_after", insert the content after the specified block.
+- For "insert_before", insert the content before the specified block.
+"""
+
+# Legacy system prompt for backward compatibility
 SYSTEM_PROMPT = """You are a basic document editing agent for a Word-like editor.
 
 Your job:
@@ -238,13 +343,15 @@ SUPPORTED ACTIONS
 - DO NOT use replace_section for simple corrections - use correct_text instead
 
 5) insert_text
-- Inserts new content at the start, end, or after a specific heading WITHOUT deleting existing content
-- Use this when the user asks to "insert", "add at the start", "add at the end", "add to this heading/section"
+- Inserts new content at the start, end, after a specific heading, or at a specific position WITHOUT deleting existing content
+- Use this when the user asks to "insert", "add at the start", "add at the end", "add to this heading/section", or "insert at position X"
 - Example: "insert 'Introduction' at the start" → adds heading at start, keeps existing content
 - Example: "add a paragraph at the end" → adds paragraph at end, keeps existing content
 - Example: "add a starting paragraph to this heading" → adds paragraph after the heading mentioned in conversation
-- location must be "start", "end", or "after_heading"
+- Example: "insert at position 100" → adds content at specific position (use location: "at_position", position: 100)
+- location must be "start", "end", "after_heading", or "at_position"
 - When location is "after_heading", heading_text is REQUIRED - extract the heading text from conversation history
+- When location is "at_position", position (number) is REQUIRED - the character position to insert at
 - If user says "this heading", "this section", "to this content", look at conversation history to find the heading text
 - anchor is usually "main" for document-level insertions
 - This is the PREFERRED action for insertions - preserves all existing content
@@ -278,6 +385,16 @@ EDIT PLAN SCHEMA (STRICT)
               "alignment": "<optional: left|center|right|justify>",
               "bold": "<optional: true|false>"
             }
+          }
+        ]
+      },
+      {
+        "type": "replace_section",
+        "anchor": "selected",
+        "blocks": [
+          {
+            "type": "paragraph",
+            "text": "Replaced selected text content"
           }
         ]
       },
@@ -334,6 +451,18 @@ EDIT PLAN SCHEMA (STRICT)
           {
             "type": "paragraph",
             "text": "This is a paragraph added after the Introduction heading"
+          }
+        ]
+      },
+      {
+        "type": "insert_text",
+        "anchor": "main",
+        "location": "at_position",
+        "position": 150,
+        "blocks": [
+          {
+            "type": "paragraph",
+            "text": "This text is inserted at position 150."
           }
         ]
       }
@@ -481,14 +610,28 @@ Think first.
 Then produce the final JSON object."""
 
 
-def generate_edit_plan(prompt: str, conversation_history: Optional[list] = None, document_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def generate_edit_plan(prompt: str, conversation_history: Optional[list] = None, document_context: Optional[Dict[str, Any]] = None, semantic_document: Optional[Dict[str, Any]] = None, selected_range: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
     Generate EditPlan JSON from user prompt using Azure OpenAI
     """
     logger.info(f"Generating edit plan for prompt: {prompt[:100]}...")
     try:
+        # Choose system prompt based on whether semantic document is provided
+        use_semantic = semantic_document and semantic_document.get("sections") and semantic_document.get("blocks")
+        
+        if use_semantic:
+            sections_count = len(semantic_document.get("sections", []))
+            blocks_count = len(semantic_document.get("blocks", {}))
+            logger.info(f"Using semantic document model - {sections_count} sections, {blocks_count} blocks - expecting 'ops' format in response")
+        else:
+            logger.info("Using legacy document model - expecting 'edit_plan' format in response")
+            if semantic_document:
+                logger.warning(f"Semantic document provided but invalid: sections={bool(semantic_document.get('sections'))}, blocks={bool(semantic_document.get('blocks'))}")
+        
+        system_prompt = SEMANTIC_SYSTEM_PROMPT if use_semantic else SYSTEM_PROMPT
+        
         # Build messages with conversation history
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages = [{"role": "system", "content": system_prompt}]
         
         # Add conversation history if provided
         if conversation_history:
@@ -508,8 +651,31 @@ def generate_edit_plan(prompt: str, conversation_history: Optional[list] = None,
                         "content": msg["content"]
                     })
         
-        # Build user message with document context
+        # Build user message with document context and selected range
         user_message = f"User request: {prompt}\n\n"
+        
+        # Add semantic document structure if provided
+        if use_semantic:
+            sections = semantic_document.get("sections", [])
+            blocks = semantic_document.get("blocks", {})
+            
+            user_message += "DOCUMENT STRUCTURE (with stable block IDs):\n"
+            user_message += json.dumps({
+                "sections": sections,
+                "blocks": blocks
+            }, indent=2)
+            user_message += "\n\n"
+            user_message += "IMPORTANT: Use the block IDs above to reference specific blocks. Do NOT invent block IDs.\n"
+            user_message += "When choosing where to insert content, analyze the semantic structure and choose the most appropriate block_id.\n\n"
+        
+        # Add selected range information if provided
+        if selected_range and isinstance(selected_range, dict):
+            selected_text = selected_range.get("text", "")
+            selected_tag = selected_range.get("tag", "")
+            if selected_text and selected_tag:
+                user_message += f"IMPORTANT: The user has selected specific text in the document:\n"
+                user_message += f'Selected text: "{selected_text}"\n\n'
+                user_message += "You MUST use replace_section with anchor 'selected' to replace ONLY this selected section. The selection is marked with a Content Control tag. Do NOT replace the entire document.\n\n"
         
         # Add document context (headings and relevant content) if provided
         if document_context:
@@ -580,7 +746,12 @@ def generate_edit_plan(prompt: str, conversation_history: Optional[list] = None,
                 user_message += "- Make intelligent placement decisions based on document structure and relevant content\n"
                 user_message += "- If document has existing content, use insert_text instead of replace_section unless explicitly asked to replace\n\n"
         
-        user_message += "Generate the EditPlan JSON:"
+        if use_semantic:
+            user_message += "IMPORTANT: You MUST respond with JSON in this exact format:\n"
+            user_message += '{\n  "response": "Your explanation",\n  "ops": [\n    {\n      "action": "insert_after",\n      "target_block_id": "b1",\n      "content": "Text to insert",\n      "reason": "Why this location"\n    }\n  ]\n}\n'
+            user_message += "Do NOT use 'edit_plan' format. Use 'ops' format only.\n"
+        else:
+            user_message += "Generate the EditPlan JSON:"
         messages.append({"role": "user", "content": user_message})
 
         # Call Azure OpenAI with structured output
@@ -613,9 +784,13 @@ def generate_edit_plan(prompt: str, conversation_history: Optional[list] = None,
         
         content = response.choices[0].message.content.strip()
         
+        # Log the raw response for debugging (first 500 chars)
+        logger.info(f"Raw AI response (first 500 chars): {content[:500]}")
+        
         # Parse JSON
         try:
             result = json.loads(content)
+            logger.info(f"Parsed JSON keys: {list(result.keys())}")
         except json.JSONDecodeError as e:
             # Try to extract JSON from markdown code blocks if present
             if "```json" in content:
@@ -646,20 +821,64 @@ def generate_edit_plan(prompt: str, conversation_history: Optional[list] = None,
                 else:
                     raise ValueError(f"Invalid JSON response: {e}")
 
-        # Validate structure
-        if "edit_plan" not in result:
-            raise ValueError("Response missing 'edit_plan' field")
+        # Validate structure - handle both semantic (ops) and legacy (edit_plan) formats
+        if "ops" in result:
+            # Semantic format - convert to legacy format for compatibility
+            if "response" not in result:
+                result["response"] = "Semantic edit plan generated successfully"
+            
+            # Validate ops array
+            if not isinstance(result["ops"], list):
+                raise ValueError("'ops' must be an array")
+            if len(result["ops"]) == 0:
+                raise ValueError("Semantic edit plan must have at least one operation in 'ops' array")
+            
+            # Convert semantic format to legacy format
+            result["edit_plan"] = {
+                "version": "1.0",
+                "actions": []  # Empty actions for semantic plans - frontend will handle ops separately
+            }
+            # IMPORTANT: Keep ops in result for frontend to use - it will be included in EditPlanResponse
+            logger.info(f"Successfully generated semantic edit plan with {len(result['ops'])} operations")
+            logger.info(f"Result dictionary now has keys: {list(result.keys())}, ops count: {len(result['ops'])}")
+        elif "edit_plan" in result:
+            # Legacy format
+            if "response" not in result:
+                result["response"] = "Edit plan generated successfully"
+
+            # Ensure edit_plan has required structure
+            if "version" not in result["edit_plan"]:
+                result["edit_plan"]["version"] = "1.0"
+            if "actions" not in result["edit_plan"]:
+                result["edit_plan"]["actions"] = []
+
+            # Validate that legacy edit plan has actions
+            if len(result["edit_plan"]["actions"]) == 0:
+                if use_semantic:
+                    # If we expected semantic format but got legacy with empty actions, this is an error
+                    logger.error("Expected semantic format (ops) but got legacy format (edit_plan) with 0 actions")
+                    raise ValueError("AI returned legacy format with 0 actions when semantic format was expected. The AI should return 'ops' format when semantic document is provided.")
+                else:
+                    logger.warning("Legacy edit plan has 0 actions - this might indicate an issue")
+                    # Don't raise error for legacy mode - allow empty actions (might be intentional)
+            
+            logger.info(f"Successfully generated edit plan with {len(result['edit_plan']['actions'])} actions")
+            # For legacy plans, ensure ops is None (not missing) so Pydantic doesn't exclude it
+            if "ops" not in result:
+                result["ops"] = None
+        else:
+            # Log what we actually got
+            logger.error(f"Response missing both 'edit_plan' and 'ops' fields. Response keys: {list(result.keys())}")
+            raise ValueError(f"Response missing both 'edit_plan' and 'ops' fields. Got keys: {list(result.keys())}")
         
-        if "response" not in result:
-            result["response"] = "Edit plan generated successfully"
-
-        # Ensure edit_plan has required structure
-        if "version" not in result["edit_plan"]:
-            result["edit_plan"]["version"] = "1.0"
-        if "actions" not in result["edit_plan"]:
-            result["edit_plan"]["actions"] = []
-
-        logger.info(f"Successfully generated edit plan with {len(result['edit_plan']['actions'])} actions")
+        # Ensure ops is always present in result (either as list or None)
+        if "ops" not in result:
+            result["ops"] = None
+        
+        logger.info(f"Final result keys before return: {list(result.keys())}")
+        if result.get("ops"):
+            logger.info(f"Final result has {len(result['ops'])} ops")
+        
         return result
 
     except HTTPException:
@@ -681,8 +900,26 @@ async def generate_edit_plan_endpoint(request: GenerateEditPlanRequest):
         document_context_dict = None
         if request.document_context:
             document_context_dict = request.document_context.dict() if hasattr(request.document_context, 'dict') else request.document_context
-        result = generate_edit_plan(request.prompt, request.conversation_history, document_context_dict)
-        return EditPlanResponse(**result)
+        semantic_document_dict = None
+        if request.semantic_document:
+            semantic_document_dict = request.semantic_document.dict() if hasattr(request.semantic_document, 'dict') else request.semantic_document
+        selected_range_dict = None
+        if request.selected_range:
+            selected_range_dict = request.selected_range if isinstance(request.selected_range, dict) else request.selected_range.dict() if hasattr(request.selected_range, 'dict') else None
+        result = generate_edit_plan(request.prompt, request.conversation_history, document_context_dict, semantic_document_dict, selected_range_dict)
+        
+        # Log what we're returning
+        logger.info(f"Returning EditPlanResponse with keys: {list(result.keys())}")
+        if "ops" in result and result["ops"] is not None:
+            logger.info(f"Returning EditPlanResponse with {len(result['ops'])} ops")
+        elif "ops" in result:
+            logger.info("Returning EditPlanResponse with ops=None (legacy plan)")
+        
+        response = EditPlanResponse(**result)
+        logger.info(f"EditPlanResponse object has ops: {response.ops is not None}")
+        if response.ops is not None:
+            logger.info(f"EditPlanResponse.ops has {len(response.ops)} operations")
+        return response
     except HTTPException:
         raise
     except Exception as e:
